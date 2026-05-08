@@ -2,10 +2,6 @@
 //  DVSMCore.swift
 //  DVSM v∞ — Reality-Stable Monolith + Lattice Extension
 //
-//  Primary Author: Daniel J. Dillberg
-//  Status: REFERENCE STANDARD [Lattice Integrated]
-//  Copyright © 2024. All Rights Reserved.
-//
 
 import Foundation
 import Accelerate
@@ -23,13 +19,12 @@ public final class DVSMBitBlock: @unchecked Sendable {
         self.buffer.initializeMemory(as: UInt8.self, repeating: 0, count: 2048)
     }
 
-    /// bit-perfect transfer from candidate arrays
     internal init(from doubles: [Double]) {
         self.buffer = UnsafeMutableRawPointer.allocate(byteCount: 2048, alignment: 64)
         let ptr = self.buffer.assumingMemoryBound(to: UInt64.self)
+
         for i in 0..<256 {
             let val = i < doubles.count ? doubles[i] : 0.0
-            // Final normalization pass before bit-locking
             let clean = val.isFinite ? (val == 0.0 ? 0.0 : val) : 0.0
             ptr[i] = clean.bitPattern.littleEndian
         }
@@ -60,19 +55,22 @@ public struct DVMSLatticeResult {
 }
 
 public struct DVMSLattice {
+
     private static let step: Double = 0.125
 
     public static func project(_ flux: [Double]) -> DVMSLatticeResult {
-        var projected = [Double]()
-        var residual = [Double]()
-        
+
+        var projected: [Double] = []
+        var residual: [Double] = []
+
         for v in flux {
             let clean = v.isFinite ? v : 0.0
             let p = (clean / step).rounded() * step
+
             projected.append(p)
             residual.append(clean - p)
         }
-        
+
         return DVMSLatticeResult(projected: projected, residual: residual)
     }
 }
@@ -103,7 +101,34 @@ public struct DVSMLaw {
 
         var next = [Double](repeating: 0.0, count: 256)
 
-        for i in 0.. String {
+        for i in 0..<256 {
+
+            let s = Double(bitPattern: S[i].littleEndian)
+            let v = V[i % V.count]
+
+            next[i] = (1.0 - tau) * s + tau * v
+        }
+
+        return DVSMBitBlock(from: next)
+    }
+}
+
+// =====================================================
+// MARK: - 3. EXECUTION NODE (Single Authority)
+// =====================================================
+
+public final class DVSMNode {
+
+    private var physicalState = DVSMBitBlock()
+    private var sequence: UInt64 = 0
+    private var lastHash: String = ""
+
+    private let lock = NSLock()
+
+    public init() {}
+
+    public func pulse(input: [Double]) -> String {
+
         lock.lock(); defer { lock.unlock() }
 
         // 1. Law Proposal
@@ -113,16 +138,17 @@ public struct DVSMLaw {
             latticeEnabled: true
         )
 
-        // 2. Commit (Atomic Pointer Update)
+        // 2. Commit
         self.physicalState = candidate
 
-        // 3. Hash (Deterministic Observation)
+        // 3. Hash
         let hash = SHA256.hash(data: physicalState.bytes)
             .compactMap { String(format: "%02x", $0) }
             .joined()
 
         self.lastHash = hash
         self.sequence += 1
+
         return hash
     }
 }
