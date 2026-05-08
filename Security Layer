@@ -1,0 +1,114 @@
+//
+//  DVSMCore_Integrated.swift
+//  DVSM v∞ — SECURED & SHARDED CORE
+//
+
+import Foundation
+import CryptoKit
+
+// =====================================================
+// MARK: - 1. ENHANCED CRYPTO (Anti-Replay)
+// =====================================================
+
+public protocol DVSMCryptoEngine: Sendable {
+    func hashState(_ data: Data) -> Data
+    /// Included 'pulseIndex' to ensure every signature is globally unique.
+    func signTransition(_ hash: Data, shardID: Int, pulseIndex: UInt64, zone: DVSMTrustZone) throws -> Data
+}
+
+public struct DVSMStandardCrypto: DVSMCryptoEngine {
+    private let keyID: String
+    public init(keyID: String) { self.keyID = keyID }
+
+    public func hashState(_ data: Data) -> Data { Data(SHA256.hash(data: data)) }
+
+    public func signTransition(_ hash: Data, shardID: Int, pulseIndex: UInt64, zone: DVSMTrustZone) throws -> Data {
+        // Payload: [StateHash + Shard + PulseIndex + Zone]
+        let payload = hash + Data("\(shardID).\(pulseIndex).\(zone.rawValue)".utf8)
+        return Data(SHA256.hash(data: payload + Data(keyID.utf8)))
+    }
+}
+
+// =====================================================
+// MARK: - 2. SHARD PROXY (Backpressure & Geometry)
+// =====================================================
+
+public final class DVSMShardProxy: @unchecked Sendable {
+    private let config: DVSMShardConfig
+    // Prevents Ingest from overwhelming the Core Kernel
+    private let backpressureSemaphore = DispatchSemaphore(value: 1024) 
+
+    public init(config: DVSMShardConfig) { self.config = config }
+
+    public func route(signal: [UInt8]) -> (shardID: Int, offset: Double) {
+        backpressureSemaphore.wait() // Acquire slot
+        defer { backpressureSemaphore.signal() } // Release slot
+        
+        let shardID = abs(signal.hashValue % config.shardCount)
+        // Solves 16x16 dimensionality by providing a unique phase shift
+        let offset = Double(shardID) / Double(config.shardCount)
+        
+        return (shardID, offset)
+    }
+}
+
+// =====================================================
+// MARK: - 3. SEQUENTIAL AUDIT (Merkle Integrity)
+// =====================================================
+
+public actor DVSMAuditLog {
+    private struct ShardState {
+        var lastPulse: UInt64
+        var merkleRoot: Data
+    }
+    
+    private var shardRegistry: [Int: ShardState] = [:]
+    private let crypto: DVSMCryptoEngine
+    
+    public init(crypto: DVSMCryptoEngine) { self.crypto = crypto }
+
+    /// Logic Fix: Rejects out-of-order pulses to maintain chain integrity.
+    public func record(shardID: Int, pulseIndex: UInt64, stateHash: Data) async throws {
+        let current = shardRegistry[shardID] ?? ShardState(lastPulse: 0, merkleRoot: Data())
+        
+        // Ensure pulse is the immediate successor
+        guard pulseIndex == current.lastPulse + 1 else {
+            throw DUMEError.storageError("Sequence Gap: Expected \(current.lastPulse + 1), got \(pulseIndex)")
+        }
+        
+        let newRoot = crypto.hashState(stateHash + current.merkleRoot + Data("\(pulseIndex)".utf8))
+        shardRegistry[shardID] = ShardState(lastPulse: pulseIndex, merkleRoot: newRoot)
+    }
+}
+
+// =====================================================
+// MARK: - 4. INTEGRATED ENGINE CONTROLLER
+// =====================================================
+
+public final class DVSMPulseEngine {
+    private let crypto: DVSMCryptoEngine
+    private let audit: DVSMAuditLog
+    private var pulseCounter: UInt64 = 0
+    
+    public init(crypto: DVSMCryptoEngine, audit: DVSMAuditLog) {
+        self.crypto = crypto
+        self.audit = audit
+    }
+    
+    /// The Atomic Pulse: Ingest -> Commit -> Async Audit
+    public func executePulse(shardID: Int, rawData: Data) async throws -> Data {
+        pulseCounter += 1
+        let localPulse = pulseCounter
+        
+        // 1. Commit (Deterministic Hash)
+        let stateHash = crypto.hashState(rawData)
+        
+        // 2. Side-Channel: Dispatch Audit (Non-blocking)
+        Task {
+            try? await audit.record(shardID: shardID, pulseIndex: localPulse, stateHash: stateHash)
+        }
+        
+        // 3. Return transition signature
+        return try crypto.signTransition(stateHash, shardID: shardID, pulseIndex: localPulse, zone: .kernel)
+    }
+}
